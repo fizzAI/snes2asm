@@ -88,19 +88,35 @@ class SPC700Disassembler:
 
 	def get_label_or_addr(self, target_addr):
 		"""
-		Get a label for target if in range, otherwise return absolute address.
+		Get a label for target if inside the data, otherwise None.
 
 		Args:
 			target_addr: Absolute address to get label for
 
 		Returns:
-			Label name if in range, otherwise $XXXX format address
+			Label name if in range, otherwise None
 		"""
 		target_offset = target_addr - self.start_addr
 		if 0 <= target_offset < len(self.data):
 			return self.get_label(target_addr)
-		else:
-			return "$%04X" % target_addr
+		return None
+
+	def relative_ins(self, prefix, ins_len, target, comment=None):
+		"""
+		Relative branch instruction. Branches to a target outside the data have
+		no label to reference and fall back to data bytes.
+		"""
+		operand = self.get_label_or_addr(target)
+		if operand == None:
+			data = ", ".join("$%02X" % self.data[self.pos + i] for i in range(ins_len))
+			return self.ins(".byte " + data, comment="%s $%04X (target outside data)" % (prefix, target))
+		return self.ins("%s %s" % (prefix, operand), comment)
+
+	def relative_branch(self, mnemonic):
+		"""Two byte relative branch instruction."""
+		offset = self.pipe8_signed()
+		target = (self.start_addr + self.pos + 2 + offset) & 0xFFFF
+		return self.relative_ins(mnemonic, 2, target)
 
 	def trace_code(self):
 		"""
@@ -248,7 +264,7 @@ class SPC700Disassembler:
 				# Incomplete instruction at end of data
 				remaining = len(self.data) - self.pos
 				hex_bytes = " ".join("%02X" % self.data[self.pos + i] for i in range(remaining))
-				ins = self.ins(".db " + ", ".join("$%02X" % self.data[self.pos + i] for i in range(remaining)),
+				ins = self.ins(".byte " + ", ".join("$%02X" % self.data[self.pos + i] for i in range(remaining)),
 				               comment="Incomplete instruction: %s" % hex_bytes)
 				yield (offset, ins)
 				break
@@ -275,7 +291,7 @@ class SPC700Disassembler:
 	def op_unknown(self):
 		"""Handler for unknown/unimplemented opcodes."""
 		op = self.data[self.pos]
-		return self.ins(".db $%02X" % op, comment="Unknown opcode")
+		return self.ins(".byte $%02X" % op, comment="Unknown opcode")
 
 	def pipe8(self):
 		"""Read 8-bit immediate value."""
@@ -392,9 +408,8 @@ class SPC700Disassembler:
 		# Check for I/O register
 		if dp in self.IO_REGISTERS:
 			reg_name, reg_desc = self.IO_REGISTERS[dp]
-			return self.ins("%s %s.%d,%s" % (mnemonic, reg_name, bit, self.get_label_or_addr(target)),
-			               comment=reg_desc)
-		return self.ins("%s $%02X.%d,%s" % (mnemonic, dp, bit, self.get_label_or_addr(target)))
+			return self.relative_ins("%s %s.%d," % (mnemonic, reg_name, bit), 3, target, comment=reg_desc)
+		return self.relative_ins("%s $%02X.%d," % (mnemonic, dp, bit), 3, target)
 
 	def addr_direct(self):
 		"""Direct page address: $XX or register name."""
@@ -420,22 +435,36 @@ class SPC700Disassembler:
 			return self.IO_REGISTERS[addr][0] + "+Y"  # Return register name from tuple
 		return "$%02X+Y" % addr
 
+	@staticmethod
+	def force_absolute(value):
+		"""Absolute 16-bit operand. llvm-mos auto-selects the addressing width
+		of a plain constant from its value, so small values need the size
+		modifier applied through a relocatable expression."""
+		if value > 0xFF:
+			return "$%04X" % value
+		return "!($%04X + __abs_base)" % value
+
 	def addr_absolute(self):
-		"""Absolute address: !$XXXX."""
-		return "!$%04X" % self.pipe16()
+		"""Absolute address: $XXXX."""
+		return self.force_absolute(self.pipe16())
 
 	def addr_absolute_label(self):
-		"""Absolute address as label for jumps/calls."""
+		"""Absolute address as label for jumps/calls. The label is referred to
+		relative to __spc_base so the operand keeps its load address."""
 		target = self.pipe16()
-		return self.get_label_or_addr(target)
+		target_offset = target - self.start_addr
+		if 0 <= target_offset < len(self.data):
+			return "!(%s - __spc_base + $%04X)" % (self.get_label(target), self.start_addr)
+		else:
+			return self.force_absolute(target)
 
 	def addr_absolute_x(self):
-		"""Absolute indexed by X: !$XXXX+X."""
-		return "!$%04X+X" % self.pipe16()
+		"""Absolute indexed by X: $XXXX+X."""
+		return self.force_absolute(self.pipe16()) + "+X"
 
 	def addr_absolute_y(self):
-		"""Absolute indexed by Y: !$XXXX+Y."""
-		return "!$%04X+Y" % self.pipe16()
+		"""Absolute indexed by Y: $XXXX+Y."""
+		return self.force_absolute(self.pipe16()) + "+Y"
 
 	def addr_indirect_x(self):
 		"""Indirect X: [$XX+X]."""
@@ -538,7 +567,7 @@ class SPC700Disassembler:
 	def op0E(self): return self.ins("tset1 %s" % self.addr_absolute())
 	def op0F(self): return self.ins("brk")
 
-	def op10(self): return self.ins("bpl %s" % self.addr_relative())
+	def op10(self): return self.relative_branch("bpl")
 
 	def op14(self): return self.ins("or A,%s" % self.addr_direct_x())
 	def op15(self): return self.ins("or A,%s" % self.addr_absolute_x())
@@ -551,7 +580,7 @@ class SPC700Disassembler:
 	def op1C(self): return self.ins("asl A")
 	def op1D(self): return self.ins("dec X")
 	def op1E(self): return self.ins("cmp X,%s" % self.addr_absolute())
-	def op1F(self): return self.ins("jmp [%s+X]" % self.addr_absolute())
+	def op1F(self): return self.ins("jmp [$%04X+X]" % self.pipe16())
 
 	def op20(self): return self.ins("clrp")
 
@@ -578,11 +607,11 @@ class SPC700Disassembler:
 		# Check for I/O register
 		if dp in self.IO_REGISTERS:
 			reg_name, reg_desc = self.IO_REGISTERS[dp]
-			return self.ins("cbne %s,%s" % (reg_name, self.get_label_or_addr(target)), comment=reg_desc)
-		return self.ins("cbne $%02X,%s" % (dp, self.get_label_or_addr(target)))
-	def op2F(self): return self.ins("bra %s" % self.addr_relative())
+			return self.relative_ins("cbne %s," % reg_name, 3, target, comment=reg_desc)
+		return self.relative_ins("cbne $%02X," % dp, 3, target)
+	def op2F(self): return self.relative_branch("bra")
 
-	def op30(self): return self.ins("bmi %s" % self.addr_relative())
+	def op30(self): return self.relative_branch("bmi")
 
 	def op34(self): return self.ins("and A,%s" % self.addr_direct_x())
 	def op35(self): return self.ins("and A,%s" % self.addr_absolute_x())
@@ -595,7 +624,7 @@ class SPC700Disassembler:
 	def op3C(self): return self.ins("rol A")
 	def op3D(self): return self.ins("inc X")
 	def op3E(self): return self.ins("cmp X,%s" % self.addr_direct())
-	def op3F(self): return self.ins("call !%s" % self.addr_absolute_label())
+	def op3F(self): return self.ins("call %s" % self.addr_absolute_label())
 
 	def op40(self): return self.ins("setp")
 
@@ -616,7 +645,7 @@ class SPC700Disassembler:
 	def op4E(self): return self.ins("tclr1 %s" % self.addr_absolute())
 	def op4F(self): return self.ins("pcall $%02X" % self.pipe8())
 
-	def op50(self): return self.ins("bvc %s" % self.addr_relative())
+	def op50(self): return self.relative_branch("bvc")
 
 	def op54(self): return self.ins("eor A,%s" % self.addr_direct_x())
 	def op55(self): return self.ins("eor A,%s" % self.addr_absolute_x())
@@ -629,7 +658,7 @@ class SPC700Disassembler:
 	def op5C(self): return self.ins("lsr A")
 	def op5D(self): return self.ins("mov X,A")
 	def op5E(self): return self.ins("cmp Y,%s" % self.addr_absolute())
-	def op5F(self): return self.ins("jmp !%s" % self.addr_absolute_label())
+	def op5F(self): return self.ins("jmp %s" % self.addr_absolute_label())
 
 	def op60(self): return self.ins("clrc")
 
@@ -656,11 +685,11 @@ class SPC700Disassembler:
 		# Check for I/O register
 		if dp in self.IO_REGISTERS:
 			reg_name, reg_desc = self.IO_REGISTERS[dp]
-			return self.ins("dbnz %s,%s" % (reg_name, self.get_label_or_addr(target)), comment=reg_desc)
-		return self.ins("dbnz $%02X,%s" % (dp, self.get_label_or_addr(target)))
+			return self.relative_ins("dbnz %s," % reg_name, 3, target, comment=reg_desc)
+		return self.relative_ins("dbnz $%02X," % dp, 3, target)
 	def op6F(self): return self.ins("ret")
 
-	def op70(self): return self.ins("bvs %s" % self.addr_relative())
+	def op70(self): return self.relative_branch("bvs")
 
 	def op74(self): return self.ins("cmp A,%s" % self.addr_direct_x())
 	def op75(self): return self.ins("cmp A,%s" % self.addr_absolute_x())
@@ -694,7 +723,7 @@ class SPC700Disassembler:
 	def op8E(self): return self.ins("pop PSW")
 	def op8F(self): return self.direct_imm_lookup("mov")
 
-	def op90(self): return self.ins("bcc %s" % self.addr_relative())
+	def op90(self): return self.relative_branch("bcc")
 
 	def op94(self): return self.ins("adc A,%s" % self.addr_direct_x())
 	def op95(self): return self.ins("adc A,%s" % self.addr_absolute_x())
@@ -728,7 +757,7 @@ class SPC700Disassembler:
 	def opAE(self): return self.ins("pop A")
 	def opAF(self): return self.ins("mov (X)+,A")
 
-	def opB0(self): return self.ins("bcs %s" % self.addr_relative())
+	def opB0(self): return self.relative_branch("bcs")
 
 	def opB4(self): return self.ins("sbc A,%s" % self.addr_direct_x())
 	def opB5(self): return self.ins("sbc A,%s" % self.addr_absolute_x())
@@ -762,7 +791,7 @@ class SPC700Disassembler:
 	def opCE(self): return self.ins("pop X")
 	def opCF(self): return self.ins("mul YA")
 
-	def opD0(self): return self.ins("bne %s" % self.addr_relative())
+	def opD0(self): return self.relative_branch("bne")
 
 	def opD4(self): return self.ins("mov %s,A" % self.addr_direct_x())
 	def opD5(self): return self.ins("mov %s,A" % self.addr_absolute_x())
@@ -779,7 +808,7 @@ class SPC700Disassembler:
 		rel_byte = self.data[self.pos + 2]
 		rel = rel_byte if rel_byte <= 127 else rel_byte - 256
 		target = (self.start_addr + self.pos + 3 + rel) & 0xFFFF
-		return self.ins("cbne [$%02X+X],%s" % (dp, self.get_label_or_addr(target)))
+		return self.relative_ins("cbne $%02X+X," % dp, 3, target)
 	def opDF(self): return self.ins("daa A")
 
 	def opE0(self): return self.ins("clrv")
@@ -801,7 +830,7 @@ class SPC700Disassembler:
 	def opEE(self): return self.ins("pop Y")
 	def opEF(self): return self.ins("sleep")
 
-	def opF0(self): return self.ins("beq %s" % self.addr_relative())
+	def opF0(self): return self.relative_branch("beq")
 
 	def opF4(self): return self.ins("mov A,%s" % self.addr_direct_x())
 	def opF5(self): return self.ins("mov A,%s" % self.addr_absolute_x())
@@ -816,5 +845,5 @@ class SPC700Disassembler:
 	def opFE(self):
 		rel = self.pipe8_signed()
 		target = (self.start_addr + self.pos + 2 + rel) & 0xFFFF
-		return self.ins("dbnz Y,%s" % self.get_label_or_addr(target))
+		return self.relative_ins("dbnz Y,", 2, target)
 	def opFF(self): return self.ins("stop")

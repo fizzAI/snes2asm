@@ -97,7 +97,7 @@ class DecoderTest(unittest.TestCase):
         
         self.assertIsInstance(result, str)
         self.assertIn('test_palette:', result)
-        self.assertIn('.dw', result)
+        self.assertIn('.word', result)
 
     def test_graphics_decoder_2bpp(self):
         """Test 2bpp graphics decoder."""
@@ -450,7 +450,7 @@ class DecoderTest(unittest.TestCase):
         
         self.assertIsInstance(result, str)
         self.assertIn('test_data:', result)
-        self.assertIn('.db', result)
+        self.assertIn('.byte', result)
 
     def test_binary_decoder(self):
         """Test binary file decoder."""
@@ -474,7 +474,7 @@ class DecoderTest(unittest.TestCase):
         
         self.assertIsInstance(result, str)
         self.assertIn('test_binary:', result)
-        self.assertIn('.INCBIN', result)
+        self.assertIn('.incbin', result)
 
     def test_decoder_factory(self):
         """Test decoder factory function."""

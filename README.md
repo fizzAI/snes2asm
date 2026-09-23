@@ -63,7 +63,7 @@ sudo python setup.py install
 
 For compiling the output project you will need:
 
-* **WLA-DX Assembler** - https://github.com/vhelin/wla-dx
+* **llvm-mos toolchain** - https://llvm-mos.org
 * **GNU Make**
 
 ## Usage
@@ -105,7 +105,7 @@ Once successfully disassembling your ROM into a project folder, the next step is
 
 ```bash
 cd output_dir
-# Edit Makefile PREFIX to point to your wla-dx install path
+# Edit the Makefile LLVM_MOS variable to point to your llvm-mos install path
 make
 # Done! Run the output_dir/game.smc file in your emulator.
 ```
@@ -324,9 +324,9 @@ field_name:
 ```
 
 **Generated output for bitfields:**
-This generates editable expressions that WLA-DX assembles into the correct bit-packed value.
+This generates editable expressions that the assembler evaluates into the correct bit-packed value.
 ```asm
-.dw ($042 << 0) | (1 << 10) | (7 << 12)  ; field_name: subfield1=$042 subfield2=1 subfield3=7
+.word (($042 << 0) | (1 << 10) | (7 << 12))  ; field_name: subfield1=$042 subfield2=1 subfield3=7
 ```
 
 #### Index Decoder:

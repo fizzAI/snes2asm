@@ -36,10 +36,10 @@ class Decoder:
 		show_label = self.label != None
 		size = self.end - self.start
 		if size <= 4:
-			yield (0, Instruction(Decoder.data_directive(size) + ' ' + self.hex_fmt[size-1] % Decoder.val(data, 0, size), preamble=self.label+":"))
+			yield (0, Instruction(Decoder.data_directive(size) + ' ' + Decoder.data_operands(size, Decoder.val(data, 0, size)), preamble=self.label+":"))
 		else:
 			for y in range(0, len(data), 16):
-				line = '.db ' + ', '.join(("$%02X" % x) for x in data[y : min(y+16, len(data))])
+				line = '.byte ' + ', '.join(("$%02X" % x) for x in data[y : min(y+16, len(data))])
 				if show_label:
 					yield (y, Instruction(line, preamble=self.label+":"))
 					show_label = False
@@ -79,7 +79,31 @@ class Decoder:
 
 	@staticmethod
 	def data_directive(size):
-		return ['.db', '.dw', '.dl', '.dd'][(size-1) & 0x3]
+		# llvm-mos has no 3-byte data directive, those split into bytes
+		return ['.byte', '.word', '.byte', '.4byte'][(size-1) & 0x3]
+
+	@staticmethod
+	def data_operands(size, value):
+		"""Operand text for one constant data entry of 1-4 bytes."""
+		if size == 3:
+			return "$%02X, $%02X, $%02X" % (value & 0xFF, (value >> 8) & 0xFF, (value >> 16) & 0xFF)
+		return Decoder.hex_fmt[size-1] % value
+
+	@staticmethod
+	def expr_operands(size, expr):
+		"""Operand text for one data entry holding an assembly expression."""
+		if size == 3:
+			return "(%s) & $FF, ((%s) >> 8) & $FF, ((%s) >> 16) & $FF" % (expr, expr, expr)
+		return "(%s)" % expr
+
+	@staticmethod
+	def symbol_operands(size, name):
+		"""Operand text for one data entry holding a relocatable symbol."""
+		if size == 1:
+			return "%s@mos16lo" % name
+		elif size == 3:
+			return "%s@mos16lo, %s@mos16hi, %s@mos24bank" % (name, name, name)
+		return name
 
 	def decompress(self, data):
 		try:
@@ -102,7 +126,7 @@ class BinaryDecoder(Decoder):
 
 	def decode(self, data):
 		file_name = self.set_output(self.label, 'bin', data)
-		yield (0, Instruction(".INCBIN \"%s\"" % file_name, preamble=self.label+":"))
+		yield (0, Instruction(".incbin \"%s\"" % file_name, preamble=self.label+":"))
 
 class TextDecoder(Decoder):
 	def __init__(self, label, start, end=0, compress=None, pack=None, index=None, translation=None):
@@ -153,21 +177,18 @@ class TextDecoder(Decoder):
 
 	def text(self, pos, vals, label):
 		if self.translation:
-			# Break STRINGMAP directives into multiple parts if needed
-			# since there is a bug with large buffers in WLA-DX
+			# Emit the encoded bytes with the translated text as a comment
+			readable = "".join(self.translation.table[char] for char in vals)
 			parts = []
-			for output_start in range(0, len(vals), 64):
-				out = []
-				output_end = min(output_start+64,len(vals))
-				for char in vals[output_start:output_end]:
-					if char in self.translation.table:
-						out.append(self.translation.table[char])
-					else:
-						out.append(_ESCAPE_CHARS[char])
-				parts.append('.STRINGMAP %s "%s"' % (self.translation.label, "".join(out)))
+			for output_start in range(0, len(vals), 16):
+				chunk = vals[output_start:output_start+16]
+				line = '.byte ' + ', '.join(("$%02X" % x) for x in chunk)
+				if output_start == 0:
+					line = line + "\t\t; " + ansi_escape(readable)
+				parts.append(line)
 			return (pos, Instruction("\n".join(parts), preamble=label))
 		else:
-			parts = ['.db "%s"' % ansi_escape(vals[i-128:i]) for i in range(128, len(vals) + 128, 128)]
+			parts = ['.ascii "%s"' % ansi_escape(vals[i-128:i]) for i in range(128, len(vals) + 128, 128)]
 			return (pos, Instruction("\n".join(parts), preamble=label))
 
 class ArrayDecoder(Decoder):
@@ -256,10 +277,9 @@ class ArrayDecoder(Decoder):
 		else:
 			# Original simple array behavior
 			instr = Decoder.data_directive(self.size) + ' '
-			form = Decoder.hex_fmt[self.size-1]
 			show_label = self.label != None
 			for y in range(0, len(data), 16):
-				parts = [form % Decoder.val(data, x, self.size) for x in range(y, min(y+16,len(data)), self.size)]
+				parts = [Decoder.data_operands(self.size, Decoder.val(data, x, self.size)) for x in range(y, min(y+16,len(data)), self.size)]
 				line = instr + ', '.join(parts)
 				if show_label:
 					yield (y, Instruction(line, preamble=self.label+":"))
@@ -323,7 +343,7 @@ class StructDecoder(Decoder):
 					# Generate bitfield expression
 					expr, comment = _generate_bitfield_expression(field, data, data_offset)
 					directive = Decoder.data_directive(field_size)
-					line = "%s %s" % (directive, expr)
+					line = "%s %s" % (directive, Decoder.expr_operands(field_size, expr))
 
 					# Add comment with field name and decoded values
 					comment = "%s: %s" % (field['name'], comment)
@@ -337,8 +357,7 @@ class StructDecoder(Decoder):
 					# Simple field
 					value = Decoder.val(data, data_offset, field_size)
 					directive = Decoder.data_directive(field_size)
-					form = Decoder.hex_fmt[field_size - 1]
-					line = "%s %s" % (directive, form % value)
+					line = "%s %s" % (directive, Decoder.data_operands(field_size, value))
 
 					if show_label:
 						yield (data_offset, Instruction(line, preamble=struct_label, comment=field['name']))
@@ -380,19 +399,19 @@ class IndexDecoder(Decoder):
 				entry_label = "%s_%i:" % (self.label, index)
 
 			if self.parent and offset + self.parent.start > self.parent.end:
-				yield(pos, Instruction('%s %i' % (instr, offset), comment='Invalid index', preamble=entry_label))
+				yield(pos, Instruction('%s %s' % (instr, Decoder.data_operands(self.size, offset)), comment='Invalid index', preamble=entry_label))
 			else:
 				if label_name:
 					# Use label name if found
-					yield(pos, Instruction('%s %s' % (instr, label_name),
+					yield(pos, Instruction('%s %s' % (instr, Decoder.symbol_operands(self.size, label_name)),
 						preamble=entry_label))
 				elif self.parent:
 					# Use parent-relative offset
-					yield(pos, Instruction('%s %s_%i - %s_0' % (instr, self.parent.label, index, self.parent.label),
+					yield(pos, Instruction('%s %s' % (instr, Decoder.expr_operands(self.size, "%s_%i - %s_0" % (self.parent.label, index, self.parent.label))),
 						preamble=entry_label))
 				else:
 					# No parent and no label, output hex value
-					yield(pos, Instruction('%s $%0*X' % (instr, self.size * 2, offset),
+					yield(pos, Instruction('%s %s' % (instr, Decoder.data_operands(self.size, offset)),
 						preamble=entry_label))
 			index = index + 1
 
@@ -422,7 +441,7 @@ class PaletteDecoder(Decoder):
 
 		self.add_extra_file("%s.rgb" % self.label, "\n".join(lines) )
 
-		yield (0, Instruction(".INCBIN \"%s\"" % file_name, preamble=self.label+":"))
+		yield (0, Instruction(".incbin \"%s\"" % file_name, preamble=self.label+":"))
 
 class GraphicDecoder(Decoder):
 	def __init__(self, label, start, end, compress=None, bit_depth=4, width=128, palette=None, palette_offset=0, mode7=False):
@@ -507,7 +526,7 @@ class GraphicDecoder(Decoder):
 		self.add_extra_file("%s_%dbpp.bmp" % (self.label, self.bit_depth), bitmap.output())
 
 		# Make binary chr file include
-		yield (0, Instruction(".INCBIN \"%s\"" % file_name, preamble=self.label+":"))
+		yield (0, Instruction(".incbin \"%s\"" % file_name, preamble=self.label+":"))
 
 class TranslationMap(Decoder):
 	def __init__(self, label, table):
@@ -523,7 +542,7 @@ class TranslationMap(Decoder):
 		self.add_extra_file("%s.tbl" % self.label, script.encode('utf-8'))
 
 	def decode(self, data):
-		yield (0, Instruction('.STRINGMAPTABLE %s "%s.tbl"' % (self.label, self.label)))
+		yield (0, Instruction('; Translation table: %s.tbl' % self.label))
 
 class SoundDecoder(Decoder):
 	def __init__(self, label, start, end, compress=None, rate=32000):
@@ -534,7 +553,7 @@ class SoundDecoder(Decoder):
 		file_name = self.set_output(self.label, 'brr', data)
 		wav_data = brr.decode(data, self.rate)
 		self.add_extra_file("%s.wav" % self.label, wav_data)
-		yield (0, Instruction(".INCBIN \"%s\"" % file_name, preamble=self.label+":"))
+		yield (0, Instruction(".incbin \"%s\"" % file_name, preamble=self.label+":"))
 
 class TileMapDecoder(Decoder):
 	def __init__(self, label, start, end, gfx, compress=None, width=128, encoding=None):
@@ -564,7 +583,7 @@ class TileMapDecoder(Decoder):
 
 		# Tile character map file
 		file_name = self.set_output(self.label, "tilebin", data)
-		yield (0, Instruction(".INCBIN \"%s\"" % file_name, preamble=self.label+":"))
+		yield (0, Instruction(".incbin \"%s\"" % file_name, preamble=self.label+":"))
 
 class SPC700Decoder(Decoder):
 	"""
@@ -622,20 +641,11 @@ class SPC700Decoder(Decoder):
 		asm_lines.append("; Data Size: $%04X (%d bytes)\n" % (data_size, data_size))
 		asm_lines.append("\n")
 
-		# Add WLA-DX directives for SPC700 assembly
-		# Use actual data size to ensure assembled output matches original
-		asm_lines.append("; WLA-DX SPC700 directives\n")
-		asm_lines.append(".MEMORYMAP\n")
-		asm_lines.append("SLOTSIZE $%X\n" % data_size)
-		asm_lines.append("DEFAULTSLOT 0\n")
-		asm_lines.append("SLOT 0 $0000\n")
-		asm_lines.append(".ENDME\n")
+		# llvm-mos assembler directives
+		asm_lines.append(".section .spc700,\"ax\"\n")
 		asm_lines.append("\n")
-		asm_lines.append(".ROMBANKMAP\n")
-		asm_lines.append("BANKSTOTAL 1\n")
-		asm_lines.append("BANKSIZE $%X\n" % data_size)
-		asm_lines.append("BANKS 1\n")
-		asm_lines.append(".ENDRO\n")
+		asm_lines.append("; Anchor for VMA independent address expressions\n")
+		asm_lines.append("__spc_base:\n")
 		asm_lines.append("\n")
 		asm_lines.append("; Include SPC700 I/O register and DSP definitions\n")
 		asm_lines.append(".include \"spc700.asm\"\n")
@@ -674,7 +684,7 @@ class SPC700Decoder(Decoder):
 		self.add_extra_file("spc700.S", "".join(asm_lines).encode('utf-8'))
 
 		# Output a single reference instruction pointing to the binary
-		yield (0, Instruction(".INCBIN \"%s\"" % file_name, preamble=self.label+":", comment="SPC700 code"))
+		yield (0, Instruction(".incbin \"%s\"" % file_name, preamble=self.label+":", comment="SPC700 code"))
 
 _ESCAPE_CHARS = ['\\' + '0', '\\x01', '\\x02', '\\x03', '\\x04', '\\x05', '\\x06', '\\x07', '\\x08', '\\t', '\\n', '\\x0b', '\\x0c', '\\r', '\\x0e', '\\x0f', '\\x10', '\\x11', '\\x12', '\\x13', '\\x14', '\\x15', '\\x16', '\\x17', '\\x18', '\\x19', '\\x1a', '\\x1b', '\\x1c', '\\x1d', '\\x1e', '\\x1f', ' ', '!', '\\"', '#', '$', '%', '&', "'", '(', ')', '*', '+', ',', '-', '.', '/', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', ':', ';', '<', '=', '>', '?', '@', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', '[', '\\', ']', '^', '_', '`', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', '{', '|', '}', '~', '\x7f', '\\x80', '\\x81', '\\x82', '\\x83', '\\x84', '\\x85', '\\x86', '\\x87', '\\x88', '\\x89', '\\x8a', '\\x8b', '\\x8c', '\\x8d', '\\x8e', '\\x8f', '\\x90', '\\x91', '\\x92', '\\x93', '\\x94', '\\x95', '\\x96', '\\x97', '\\x98', '\\x99', '\\x9a', '\\x9b', '\\x9c', '\\x9d', '\\x9e', '\\x9f', '\\xa0', '\\xa1', '\\xa2', '\\xa3', '\\xa4', '\\xa5', '\\xa6', '\\xa7', '\\xa8', '\\xa9', '\\xaa', '\\xab', '\\xac', '\\xad', '\\xae', '\\xaf', '\\xb0', '\\xb1', '\\xb2', '\\xb3', '\\xb4', '\\xb5', '\\xb6', '\\xb7', '\\xb8', '\\xb9', '\\xba', '\\xbb', '\\xbc', '\\xbd', '\\xbe', '\\xbf', '\\xc0', '\\xc1', '\\xc2', '\\xc3', '\\xc4', '\\xc5', '\\xc6', '\\xc7', '\\xc8', '\\xc9', '\\xca', '\\xcb', '\\xcc', '\\xcd', '\\xce', '\\xcf', '\\xd0', '\\xd1', '\\xd2', '\\xd3', '\\xd4', '\\xd5', '\\xd6', '\\xd7', '\\xd8', '\\xd9', '\\xda', '\\xdb', '\\xdc', '\\xdd', '\\xde', '\\xdf', '\\xe0', '\\xe1', '\\xe2', '\\xe3', '\\xe4', '\\xe5', '\\xe6', '\\xe7', '\\xe8', '\\xe9', '\\xea', '\\xeb', '\\xec', '\\xed', '\\xee', '\\xef', '\\xf0', '\\xf1', '\\xf2', '\\xf3', '\\xf4', '\\xf5', '\\xf6', '\\xf7', '\\xf8', '\\xf9', '\\xfa', '\\xfb', '\\xfc', '\\xfd', '\\xfe', '\\xff']
 
@@ -749,7 +759,7 @@ def _parse_bitfields(bitfields_def, field_name):
 	return bitfields
 
 def _generate_bitfield_expression(field, data, offset):
-	"""Generate WLA-DX expression for bit-packed field.
+	"""Generate assembly expression for bit-packed field.
 
 	Args:
 		field: Field dictionary with bitfields

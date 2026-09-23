@@ -1,33 +1,31 @@
-AS=wla-65816
-AS_SPC700=wla-spc700
-LD=wlalink
+LLVM_MOS ?= ../llvm-mos
+MC=$(LLVM_MOS)/bin/llvm-mc
+LD=$(LLVM_MOS)/bin/ld.lld
+OBJCOPY=$(LLVM_MOS)/bin/llvm-objcopy
+PYTHON ?= python3
 BMP2CHR=bmp2chr
 PACKER=packer
 BRR=brr
 ROM=game
 COBJ=game.o
+LELF=game.elf
+EMPTYFILL=%empty_fill
+CHECKSUM_OFFSET=%checksum_offset
+MCFLAGS=--arch=mos --mcpu=mosw65816
+SPCFLAGS=--arch=mos --mcpu=mosspc700
 
-all: check-wla graphics sound spc700 encodings $(ROM).smc
+all: check-llvm graphics sound spc700 encodings $(ROM).smc
 	echo "Done"
 
-# Check if WLA-DX binaries are available
-.PHONY: check-wla
-check-wla:
-	@command -v $(AS) >/dev/null 2>&1 || { \
+# Check if the llvm-mos binaries are available
+.PHONY: check-llvm
+check-llvm:
+	@command -v $(MC) >/dev/null 2>&1 || { \
 		echo ""; \
-		echo "ERROR: $(AS) not found!"; \
+		echo "ERROR: $(MC) not found!"; \
 		echo ""; \
-		echo "Please install WLA-DX Assembler:"; \
-		echo "  https://github.com/vhelin/wla-dx"; \
-		echo ""; \
-		exit 1; \
-	}
-	@command -v $(AS_SPC700) >/dev/null 2>&1 || { \
-		echo ""; \
-		echo "ERROR: $(AS_SPC700) not found!"; \
-		echo ""; \
-		echo "Please install WLA-DX Assembler:"; \
-		echo "  https://github.com/vhelin/wla-dx"; \
+		echo "Please install the llvm-mos toolchain:"; \
+		echo "  https://llvm-mos.org"; \
 		echo ""; \
 		exit 1; \
 	}
@@ -35,8 +33,17 @@ check-wla:
 		echo ""; \
 		echo "ERROR: $(LD) not found!"; \
 		echo ""; \
-		echo "Please install WLA-DX Assembler:"; \
-		echo "  https://github.com/vhelin/wla-dx"; \
+		echo "Please install the llvm-mos toolchain:"; \
+		echo "  https://llvm-mos.org"; \
+		echo ""; \
+		exit 1; \
+	}
+	@command -v $(OBJCOPY) >/dev/null 2>&1 || { \
+		echo ""; \
+		echo "ERROR: $(OBJCOPY) not found!"; \
+		echo ""; \
+		echo "Please install the llvm-mos toolchain:"; \
+		echo "  https://llvm-mos.org"; \
 		echo ""; \
 		exit 1; \
 	}
@@ -65,13 +72,14 @@ sound: $(patsubst %.wav,%.brr,$(wildcard *.wav))
 .PHONY: spc700
 spc700: $(patsubst %.S,%.spc,$(wildcard *.S))
 
-# Compile SPC700 assembly to object file
+# Assemble SPC700 assembly to an object file
 %.obj: %.S
-	$(AS_SPC700) -i -o $@ $<
+	$(MC) $(SPCFLAGS) --filetype=obj -o $@ $<
 
-# Link SPC700 object file to binary
+# Link SPC700 object file to a binary
 %.spc: %.obj
-	$(LD) -i -S linkfile_spc $@
+	$(LD) --entry=0 --defsym __abs_base=0 -o $*.elf $<
+	$(OBJCOPY) -O binary $*.elf $@
 
 .PHONY: encodings
 encodings: %encode_files
@@ -81,11 +89,15 @@ encodings: %encode_files
 main.s: $(wildcard *.asm)
 	touch main.s
 
-$(COBJ): $(wildcard *.s)
-	$(AS) -x -v -o $@ $<
+$(COBJ): main.s $(wildcard *.asm)
+	$(MC) $(MCFLAGS) --filetype=obj -o $@ main.s
 
-$(ROM).smc: $(COBJ)
-	$(LD) -d -v -S linkfile $(ROM).smc
+$(LELF): $(COBJ) link.ld
+	$(LD) --entry=0 -T link.ld -o $@ $(COBJ)
+
+$(ROM).smc: $(LELF)
+	$(OBJCOPY) -O binary --gap-fill 0x$(EMPTYFILL) $< $@
+	$(PYTHON) snescsum.py $@ $(CHECKSUM_OFFSET)
 
 clean:
-	rm -f $(ROM).smc $(COBJ) *.obj *.o *.linkfile
+	rm -f $(ROM).smc $(COBJ) $(LELF) *.obj *.elf *.spc

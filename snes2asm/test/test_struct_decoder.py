@@ -125,7 +125,7 @@ class StructDecoderTest(unittest.TestCase):
 
 		# Verify bitfield expression is generated
 		instruction_text = instructions[0][1].text()
-		self.assertIn('.dw', instruction_text)
+		self.assertIn('.word', instruction_text)
 		self.assertIn('<<', instruction_text)  # Shift operators
 		self.assertIn('|', instruction_text)   # OR operators
 		self.assertIn('tile_entry:', instruction_text)  # Field name in comment
@@ -170,7 +170,7 @@ class StructDecoderTest(unittest.TestCase):
 		self.assertEqual(len(instructions), 4)
 
 		# First field should be simple
-		self.assertIn('.db $20', instructions[0][1].text())
+		self.assertIn('.byte $20', instructions[0][1].text())
 		self.assertIn('width', instructions[0][1].text())
 
 		# Third field should have bitfield expression
@@ -535,15 +535,16 @@ class StructDecoderTest(unittest.TestCase):
 		self.assertIn('level_ptrs:', first_entry_text)
 		self.assertIn('level_ptrs_0:', first_entry_text)
 
-		# Should use .dl directive for 24-bit
-		self.assertIn('.dl', first_entry_text)
+		# Should split the 24-bit value into bytes with modifiers
+		self.assertIn('.byte', first_entry_text)
+		self.assertIn('@mos24bank', first_entry_text)
 
 		# First 2 should use labels
 		self.assertIn('rom_start', first_entry_text)
 		self.assertIn('level_1_data', instructions[1][1].text())
 
 		# Last should use hex
-		self.assertIn('$7FFFFF', instructions[2][1].text())
+		self.assertIn('$FF, $FF, $7F', instructions[2][1].text())
 
 	def test_index_without_disasm_reference(self):
 		"""Test IndexDecoder works without disasm reference (backward compatibility)."""

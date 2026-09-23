@@ -120,7 +120,7 @@ class ProjectTest(unittest.TestCase):
 		self.assertIn('Makefile', generated_files, "Makefile should be generated")
 		
 		# Should have at least one bank file
-		bank_files = [f for f in generated_files if f.startswith('bank_') and f.endswith('.asm')]
+		bank_files = [f for f in generated_files if f.startswith('bank') and f.endswith('.asm')]
 		self.assertGreater(len(bank_files), 0, "At least one bank file should be generated")
 
 	def test_project_makefile_content(self):
@@ -135,9 +135,9 @@ class ProjectTest(unittest.TestCase):
 			with open(makefile_path, 'r') as f:
 				makefile_content = f.read()
 			
-			# Should contain WLA-DX directives
-			self.assertIn('wla', makefile_content.lower(), "Makefile should reference WLA-DX")
-			self.assertIn('game.smc', makefile_content, "Makefile should target game.smc")
+			# Should reference the llvm-mos toolchain
+			self.assertIn('llvm-mos', makefile_content.lower(), "Makefile should reference llvm-mos")
+			self.assertIn('$(ROM).smc', makefile_content, "Makefile should target $(ROM).smc")
 
 	def test_project_bank_file_content(self):
 		"""Test that generated bank files have expected content."""
@@ -160,8 +160,8 @@ class ProjectTest(unittest.TestCase):
 			# Should contain assembly code
 			self.assertGreater(len(bank_content), 0, "Bank file should contain code")
 			
-			# Should contain WLA-DX directives
-			self.assertIn('.org', bank_content, "Bank file should contain .org directive")
+			# Should contain llvm-mos assembly directives
+			self.assertIn('.section', bank_content, "Bank file should contain .section directive")
 
 	def hexdump(self, data):
 		"""Helper function to create hexdump of binary data."""
@@ -173,19 +173,19 @@ class ProjectTest(unittest.TestCase):
 	def test_project_with_missing_dependencies(self):
 		"""Test project generation when external dependencies are missing."""
 		
-		# This test should work even if WLA-DX is not installed
+		# This test should work even if llvm-mos is not installed
 		# because we're only testing project generation, not compilation
 		
 		try:
 			# Generate project
 			main(['snes2asm', '-o', self.out, '-e', 0, '-c', self.conf, self.path])
 			
-			# Should succeed even without WLA-DX
+			# Should succeed even without llvm-mos
 			self.assertTrue(os.path.exists(self.out))
 			
 		except Exception as e:
-			# If it fails, it should be due to missing test files, not WLA-DX
-			if "wla" in str(e).lower() or "make" in str(e).lower():
+			# If it fails, it should be due to missing test files, not llvm-mos
+			if "llvm-mos" in str(e).lower() or "wla" in str(e).lower() or "make" in str(e).lower():
 				self.fail(f"Project generation should not depend on WLA-DX: {e}")
 			else:
 				raise  # Re-raise other exceptions

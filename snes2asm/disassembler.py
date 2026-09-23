@@ -4,6 +4,15 @@ from collections import OrderedDict
 import bisect
 from snes2asm.rangetree import RangeTree
 
+# llvm-mos selects the addressing width of a plain constant or absolute symbol
+# from its value, and its size modifiers (<, !, >) fold away on such operands.
+# Adding this zero-valued symbol (defined in the generated link.ld) keeps the
+# operand expression relocatable so the size modifier takes effect.
+ABS_BASE = "__abs_base"
+
+# llvm-mos operand size modifiers keyed by operand width in bytes
+SIZE_MOD = {1: '<', 2: '!', 3: '>'}
+
 InstructionSizes = [
 	2, 2, 2, 2, 2, 2, 2, 2, 1, 2, 1, 1, 3, 3, 3, 4, # x0
 	2, 2, 2, 2, 2, 2, 2, 2, 1, 3, 1, 1, 3, 3, 3, 4, # x1
@@ -547,25 +556,25 @@ class Disassembler:
 			if decoder:
 				# Check if the last opcode intersected with decoder
 				if self.pos < decoder.start:
-					self.code[self.pos] = self.ins('.db ' + ', '.join(("$%02X" % x) for x in self.cart[self.pos : decoder.start]), comment = 'Opcode overrunning decoder')
+					self.code[self.pos] = self.ins('.byte ' + ', '.join(("$%02X" % x) for x in self.cart[self.pos : decoder.start]), comment = 'Opcode overrunning decoder')
 					self.pos = decoder.end
 				elif self.pos + op_size > decoder.end:
 					data_end = self.pos + op_size
 					if data_end > end:
 						data_end = end
 					if decoder.end + 1 < data_end:
-						self.code[self.pos] = self.ins('.db ' + ', '.join(("$%02X" % x) for x in self.cart[decoder.end + 1: data_end]), comment = 'Opcode overrunning decoder')
+						self.code[self.pos] = self.ins('.byte ' + ', '.join(("$%02X" % x) for x in self.cart[decoder.end + 1: data_end]), comment = 'Opcode overrunning decoder')
 					self.pos = data_end
 				else:
 					self.pos = decoder.end
 				continue
 			# If opcode overruns bank boundry
 			elif (self.cart.address(self.pos) & 0xFFFF) + op_size > 0xFFFF:
-				self.code[self.pos] = self.ins(".db $%02X" % op, comment = "Opcode %02X overrunning bank boundry at %06X. Skipping." % (op, self.pos))
+				self.code[self.pos] = self.ins(".byte $%02X" % op, comment = "Opcode %02X overrunning bank boundry at %06X. Skipping." % (op, self.pos))
 				self.pos = self.pos + 1
 				continue
 			elif self.pos + op_size > end:
-				self.code[self.pos] = self.ins(".db $%02X" % op, comment = "Opcode overrunning section")
+				self.code[self.pos] = self.ins(".byte $%02X" % op, comment = "Opcode overrunning section")
 				self.pos = self.pos + 1
 				continue
 
@@ -607,11 +616,11 @@ class Disassembler:
 
 	def make_data(self, start, end):
 		for y in range(start, end, 16):
-			line = '.db ' + ', '.join(("$%02X" % x) for x in self.cart[y : y+16])
+			line = '.byte ' + ', '.join(("$%02X" % x) for x in self.cart[y : y+16])
 			self.code[y] = self.ins(line)
 		remaining = (end - start) % 16
 		if remaining != 0:
-			line = '.db ' + ', '.join(("$%02X" % x) for x in self.cart[end - remaining : end])
+			line = '.byte ' + ', '.join(("$%02X" % x) for x in self.cart[end - remaining : end])
 			self.code[y] = self.ins(line)
 
 	def support_code(self):
@@ -619,7 +628,7 @@ class Disassembler:
 
 		if self.variables:
 			for index, variable in sorted(self.variables.items()):
-				code.append(".define %s $%x\n" % (variable, index))
+				code.append("%s = $%x\n" % (variable, index))
 			code.append("\n")
 
 		for dec in self.support_decoders:
@@ -634,26 +643,25 @@ class Disassembler:
 	def bank_code(self, bank):
 
 		code = []
-		code.append(".BANK %d SLOT 0\n.ORG $0000\n\n.SECTION \"Bank%d\" FORCE\n\n" % (bank, bank))
+		code.append(".section .bank%d,\"ax\"\n\n" % bank)
 
 		addr = bank * self.cart.bank_size()
 		bank_end = self.get_bank_end(bank)
 		# Loop through all the code in the bank range
 		for addr, instr in self.code.item_range(addr, bank_end):
 			if not self.no_label and addr in self.code_labels:
-				# Bank aliases
-				if addr in self.code_label_bank_aliases:
-					bank_set = self.code_label_bank_aliases[addr]
-					for bank_alias in bank_set:
-						base = (bank_alias >> 16) & 0xE0
-						bank_label = bank_alias | (addr & 0xFFFF)
-						code.append(".BASE $%02X\nL%06X:\n" % (base, bank_label))
-					code.append(".BASE $00\n")
 				# Label
 				code.append("%s:\n" % self.code_labels[addr])
+				# Bank aliases: same code reachable through a mirrored bank,
+				# expressed as equates offset from the real label
+				if addr in self.code_label_bank_aliases:
+					bank_set = self.code_label_bank_aliases[addr]
+					for bank_alias in sorted(bank_set):
+						bank_label = bank_alias | (addr & 0xFFFF)
+						delta = bank_alias - (bank << 16)
+						code.append("L%06X = %s + $%06X\n" % (bank_label, self.code_labels[addr], delta))
 			code.append(instr.text() + "\n")
 
-		code.append(".ENDS\n")
 		return "".join(code)
 
 	def valid_label(self, index):
@@ -870,7 +878,8 @@ class Disassembler:
  
  	# BRK
 	def op00(self):
-		return self.ins("brk" + self.stack_interrupt())
+		# llvm-mos has no operand form for the BRK signature byte
+		return self.ins("brk\n\t.byte $%02X" % self.pipe8(), comment = "brk signature")
  
  	# CLC
 	def op18(self):
@@ -948,7 +957,8 @@ class Disassembler:
 
 	# COP
 	def op02(self):
-		return self.ins("cop" + self.stack_interrupt())
+		# llvm-mos has no cop instruction, emit as data
+		return self.ins(".byte $02, $%02X" % self.pipe8(), comment = "opcode cop $%02X" % self.pipe8())
 
 	# CPX
 	def opE0(self):
@@ -1078,9 +1088,9 @@ class Disassembler:
 			index = self.cart.index(address)
 
 		if self.valid_label(index) and not self.no_label:
-			return self.ins("%s %s.w" % (op, self.label_name(index)))
+			return self.ins("%s %s" % (op, self.label_operand(self.label_name(index), 2)))
 		else:
-			return self.ins("%s $%04X.w" % (op, pipe))
+			return self.ins("%s %s" % (op, self.num_operand(pipe, 2)))
 
 	def jmp_abs_long(self, op):
 		pipe = self.pipe24()
@@ -1089,7 +1099,7 @@ class Disassembler:
 
 		# Bad address
 		if index == -1 or not self.valid_label(index) or self.no_label:
-			return self.ins("%s $%06X.l" % (op, pipe))
+			return self.ins("%s %s" % (op, self.num_operand(pipe, 3)))
 
 		pipe_bank = 0xFF0000 & pipe
 		if self.cart.hirom:
@@ -1112,9 +1122,9 @@ class Disassembler:
 			else:
 				label = pipe_bank | (0xFFFF & index)
 
-			return self.ins("%s L%06X.l" % (op, label))
+			return self.ins("%s %s" % (op, self.label_operand("L%06X" % label, 3)))
 		else:
-			return self.ins("%s %s.l" % (op, self.label_name(index)))
+			return self.ins("%s %s" % (op, self.label_operand(self.label_name(index), 3)))
 
 	def op6C(self):
 		return self.ins("jmp" + self.abs_indir())
@@ -1126,7 +1136,7 @@ class Disassembler:
 		return self.jmp_abs_long("jmp")
 
 	def opDC(self):
-		return self.ins("jmp.w" + self.abs_indir_long())
+		return self.ins("jml" + self.abs_indir_long())
 
 	# JSR
 	def op22(self):
@@ -1360,10 +1370,10 @@ class Disassembler:
 		self.flags = self.flags & (~val)
 		pre = None
 		if val & 0x20:
-			pre = ".ACCU 16"
+			pre = "; 16-bit accumulator"
 		if val & 0x10:
 			pre = pre + "\n" if pre else ""
-			pre = pre + ".INDEX 16"
+			pre = pre + "; 16-bit index registers"
 		return self.ins("rep #$%02X" % self.pipe8(), pre )
 
 	# SEP
@@ -1372,10 +1382,10 @@ class Disassembler:
 		self.flags = self.flags | val
 		pre = None
 		if val & 0x20:
-			pre = ".ACCU 8"
+			pre = "; 8-bit accumulator"
 		if val & 0x10:
 			pre = pre + "\n" if pre else ""
-			pre = pre + ".INDEX 8"
+			pre = pre + "; 8-bit index registers"
 		return self.ins("sep #$%02X" % self.pipe8(), pre )
 
 	# ROL
@@ -1580,21 +1590,21 @@ class Disassembler:
 	def opBB(self):
 		return self.ins("tyx")
  
- 	# TAD
+ 	# TCD
 	def op5B(self):
-		return self.ins("tad")
+		return self.ins("tcd")
  
- 	# TDA
+ 	# TDC
 	def op7B(self):
-		return self.ins("tda")
+		return self.ins("tdc")
 
- 	# TAS
+ 	# TCS
 	def op1B(self):
-		return self.ins("tas")
+		return self.ins("tcs")
  
- 	# TSA
+ 	# TSC
 	def op3B(self):
-		return self.ins("tsa")
+		return self.ins("tsc")
  
  	# TRB
 	def op1C(self):
@@ -1616,7 +1626,7 @@ class Disassembler:
  
  	# WDM
 	def op42(self):
-		return self.ins(".db $42, $%02X" % self.pipe8(), comment = "opcode wdm $%02X" % self.pipe8())
+		return self.ins("wdm #$%02X" % self.pipe8(), comment = "opcode wdm $%02X" % self.pipe8())
  
  	# XBA
 	def opEB(self):
@@ -1628,29 +1638,67 @@ class Disassembler:
 
 	# Address modes
 
+	@staticmethod
+	def num_operand(value, size):
+		# Numeric operand of a specific addressing width. llvm-mos auto-selects
+		# the width of a plain constant from its value, so smaller values need
+		# the size modifier applied through a relocatable expression.
+		if size == 1:
+			return "$%02X" % value
+		elif size == 2:
+			if value > 0xFF:
+				return "$%04X" % value
+			return "!($%04X + %s)" % (value, ABS_BASE)
+		else:
+			if value > 0xFFFF:
+				return "$%06X" % value
+			return ">($%06X + %s)" % (value, ABS_BASE)
+
+	@staticmethod
+	def label_operand(name, size):
+		# Relocatable label: the modifier selects the addressing width
+		return "%s%s" % (SIZE_MOD[size], name)
+
+	@staticmethod
+	def name_operand(name, value, size):
+		# Absolute symbol: llvm-mos picks the addressing width from the value
+		# unless the operand is wider, then force it through a relocatable
+		# expression (modifiers fold away on absolute symbols)
+		natural = 1 if value <= 0xFF else (2 if value <= 0xFFFF else 3)
+		if natural == size:
+			return name
+		return "%s(%s + %s)" % (SIZE_MOD[size], name, ABS_BASE)
+
 	def immediate(self):
 		if self.acc16():
-			return " #$%04X.w" % self.pipe16()
+			val = self.pipe16()
+			if val > 0xFF:
+				return " #$%04X" % val
+			# Force the 16-bit immediate encoding on small values
+			return " #mos16($%04X)" % val
 		else:
-			return " #$%02X.b" % self.pipe8()
+			return " #$%02X" % self.pipe8()
 
 	def immediate_ind(self):
 		if self.ind16():
-			return " #$%04X.w" % self.pipe16()
+			val = self.pipe16()
+			if val > 0xFF:
+				return " #$%04X" % val
+			return " #mos16($%04X)" % val
 		else:
-			return " #$%02X.b" % self.pipe8()
+			return " #$%02X" % self.pipe8()
 
 	def abs(self):
-		return " $%04X.w" % self.pipe16()
+		return " " + self.num_operand(self.pipe16(), 2)
 
 	def abs_lookup(self, op):
 		address = self.pipe16()
 		address_info = StaticAddresses.get(address)
 
 		if address_info:
-			return self.ins("%s %s.w" % (op, address_info[0]), comment = address_info[1])
+			return self.ins("%s %s" % (op, self.name_operand(address_info[0], address, 2)), comment = address_info[1])
 		elif address in self.variables:
-			return self.ins("%s %s.w" %  (op, self.variables[address]))
+			return self.ins("%s %s" %  (op, self.name_operand(self.variables[address], address, 2)))
 		else:
 			return self.ins(op + self.abs())
 
@@ -1659,108 +1707,107 @@ class Disassembler:
 		address_info = StaticAddresses.get(address)
 
 		if address_info:
-			return self.ins("%s %s.l" % (op, address_info[0]), comment = address_info[1])
+			return self.ins("%s %s" % (op, self.name_operand(address_info[0], address, 3)), comment = address_info[1])
 		elif address in self.variables:
-			return self.ins("%s %s.l" %  (op, self.variables[address]))
+			return self.ins("%s %s" %  (op, self.name_operand(self.variables[address], address, 3)))
 		else:
 			return self.ins(op + self.abs_long())
 
 	def abs_indir(self):
+		# Indirect long/absolute indirect operands are always 16-bit
 		address = self.pipe16()
 		if address in self.variables:
-			return " ($%s.w)" % self.variables[address]
+			return " (%s)" % self.variables[address]
 		else:
-			return " ($%04X.w)" % address
+			return " ($%04X)" % address
 
 	def abs_ind_indir(self):
 		address = self.pipe16()
 		if address in self.variables:
-			return " (%s.w,X)" % self.variables[address]
+			return " (%s,X)" % self.variables[address]
 		else:
-			return " ($%04X.w,X)" % address
+			return " ($%04X,X)" % address
 
 	def abs_indir_long(self):
 		address = self.pipe16()
 		if address in self.variables:
-			return " [%s]" % self.variables[address]
+			return " (%s)" % self.variables[address]
 		else:
-			return " [$%04X]" % address
+			return " ($%04X)" % address
 
 	def abs_ind_x(self):
 		address = self.pipe16()
 		if address in self.variables:
-			return " %s.w,X" % self.variables[address]
+			return " %s,X" % self.name_operand(self.variables[address], address, 2)
 		else:
-			return " $%04X.w,X" % address
+			return " %s,X" % self.num_operand(address, 2)
 
 	def abs_ind_y(self):
 		address = self.pipe16()
 		if address in self.variables:
-			return " %s.w,Y" % self.variables[address]
+			return " %s,Y" % self.name_operand(self.variables[address], address, 2)
 		else:
-			return " $%04X.w,Y" % address
+			return " %s,Y" % self.num_operand(address, 2)
 
 	def abs_long(self):
-		return " $%06X.l" % self.pipe24()
+		return " " + self.num_operand(self.pipe24(), 3)
 	
 	def abs_long_ind_x(self):
 		address = self.pipe24()
 		if address in self.data_labels:
-			return " %s.l,X" % self.data_labels[address]
+			return " %s,X" % self.label_operand(self.data_labels[address], 3)
 		else:
-			return " $%06X.l,X" % address
+			return " %s,X" % self.num_operand(address, 3)
 
 	def dir_page(self):
 		address = self.pipe8()
 		if address in self.variables:
-			return " %s.b" % self.variables[address]
+			return " %s" % self.variables[address]
 		else:
-			return " $%02X.b" % address
+			return " $%02X" % address
 
 	def dir_page_indir(self):
 		address = self.pipe8()
 		if address in self.variables:
-			return " (%s.b)" % self.variables[address]
+			return " (%s)" % self.variables[address]
 		else:
-			return " ($%02X.b)" % address
+			return " ($%02X)" % address
 
 	def dir_page_ind_x(self):
 		address = self.pipe8()
 		if address in self.variables:
-			return " %s.b,X" % self.variables[address]
+			return " %s,X" % self.variables[address]
 		else:
-			return " $%02X.b,X" % address
+			return " $%02X,X" % address
 
 	def dir_page_ind_y(self):
 		address = self.pipe8()
 		if address in self.variables:
-			return " %s.b,Y" % self.variables[address]
+			return " %s,Y" % self.variables[address]
 		else:
-			return " $%02X.b,Y" % address
+			return " $%02X,Y" % address
 
 	def dir_page_indir_long(self):
-		return " [$%02X.b]" % self.pipe8()
+		return " [$%02X]" % self.pipe8()
 
 	def dir_page_ind_indir_x(self):
-		return " ($%02X.b,X)" % self.pipe8()
+		return " ($%02X,X)" % self.pipe8()
 
 	def dir_page_ind_indir_y(self):
-		return " ($%02X.b),Y" % self.pipe8()
+		return " ($%02X),Y" % self.pipe8()
 
 	def dir_page_indir_long_y(self):
-		return " [$%02X.b],Y" % self.pipe8()
+		return " [$%02X],Y" % self.pipe8()
 
 	def stack_rel(self):
-		return " $%02X.b,S" % self.pipe8()
+		return " $%02X,S" % self.pipe8()
 
 	def stack_rel_indir_y(self):
-		return " ($%02X.b,S),Y" % self.pipe8()
-
-	def stack_interrupt(self):
-		return " $%02X.b" % self.pipe8()
+		return " ($%02X,S),Y" % self.pipe8()
 
 	def block_move(self):
-		return " $%02X,$%02X" % (self.cart[self.pos+2], self.cart[self.pos+1])
+		# llvm-mos lists the block move banks in encoding order
+		return " #$%02X,#$%02X" % (self.cart[self.pos+1], self.cart[self.pos+2])
 
 	def branch(self, ins):
 		pipe = self.pipe8_signed()
@@ -1773,11 +1820,12 @@ class Disassembler:
 
 		if self.valid_label(index):
 			if self.no_label:
-				return self.ins("%s %3d.b" % (ins, pipe))
+				# Branch to a raw PC relative offset
+				return self.ins("%s .+2%+d" % (ins, pipe))
 			else:
-				return self.ins("%s %s.b" % (ins, self.label_name(index)))
+				return self.ins("%s %s" % (ins, self.label_name(index)))
 		else:
-			return self.ins("%s %3d.b" % (ins, pipe), comment="Invalid branch target (%s L%06X)" % (ins, index))
+			return self.ins("%s .+2%+d" % (ins, pipe), comment="Invalid branch target (%s L%06X)" % (ins, index))
 
 	def pc_rel_long(self, ins):
 		pipe = self.pipe16_signed()
@@ -1788,14 +1836,14 @@ class Disassembler:
 			address = (self.pos << 1 & 0xFF0000 ) | (0x8000 + (self.pos & 0x7FFF) + pipe + 3)
 			index = self.cart.index(address)
 
-		# wla-dx won't parse BRL/PER $XXXX liternal addresses. Forced to print as data bytes if no label.
+		# Forced to print as data bytes if there is no label to reference
 		if self.valid_label(index):
 			if self.no_label:
-				return self.ins(".db $%02X, $%02X, $%02X" % (self.cart[self.pos], self.cart[self.pos+1], self.cart[self.pos+2]), comment="%s $%X.w" % (ins, pipe & 0xFFFF))
+				return self.ins(".byte $%02X, $%02X, $%02X" % (self.cart[self.pos], self.cart[self.pos+1], self.cart[self.pos+2]), comment="%s $%X.w" % (ins, pipe & 0xFFFF))
 			else:
-				return self.ins("%s %s.w" % (ins, self.label_name(index)))
+				return self.ins("%s %s" % (ins, self.label_name(index)))
 		else:
-			return self.ins(".db $%02X, $%02X, $%02X" % (self.cart[self.pos], self.cart[self.pos+1], self.cart[self.pos+2]), comment="Invalid branch target (%s L%06X)" % (ins, index))
+			return self.ins(".byte $%02X, $%02X, $%02X" % (self.cart[self.pos], self.cart[self.pos+1], self.cart[self.pos+2]), comment="Invalid branch target (%s L%06X)" % (ins, index))
 
 	def pipe8(self):
 		return self.cart[self.pos+1]
